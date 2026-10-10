@@ -51,19 +51,30 @@ For gravity controlled by Mac tilt from launch:
 
 Tilt is off by default. Its menu status shows whether fresh motion is available. Without fresh data the water uses downward gravity. This mode is intended for the MacBook's own display: the sensor tracks the laptop body, rather than an external monitor.
 
+The CPU worker limit is selected with `--physics-workers N`. Zero selects the automatic limit, one selects serial physics, and larger values are bounded by the machine's logical CPU count:
+
+```sh
+./examples/fluid-hose/run.sh --physics-workers 1
+./examples/fluid-hose/run.sh --physics-workers 4
+```
+
+Automatic selection uses the performance-core count, falls back to the physical CPU count, and caps the limit at eight. Pools below 1,024 particles use serial calculations. On the validated M1 Pro, the automatic limit is six workers.
+
 ## How it works
 
 AppKit owns the borderless, non-focusing overlay window and the application event loop. [NSScreen](https://developer.apple.com/documentation/appkit/nsscreen) provides connected displays and their usable frames, excluding the menu bar and Dock. AppKit's bottom-left screen coordinates are converted into the top-left desktop coordinates used by Quartz and the physics. Display notifications and a periodic refresh handle monitor changes; the view updates its Metal drawable size when its backing scale changes.
 
 The native bridge reads normal on-screen windows using [Quartz Window Services](https://developer.apple.com/documentation/coregraphics/cgwindowlistcopywindowinfo%28_%3A_%3A%29?language=_5). Their bounding rectangles become collision obstacles in the selected display's desktop coordinate system. Window bounds refresh eight times per second; the app does not capture window contents or read window titles.
 
-The C++ simulation applies gravity and particle density constraints, using a spatial grid for neighboring particles. Each relaxation iteration caches a particle's neighbors and distances for its pressure pass, with scratch memory reused across steps. Water is retained until you clear it, so it accumulates instead of disappearing. The current capacity is 8,000 particles.
+The C++ simulation applies gravity and particle density constraints using a uniform spatial grid. Cells are 12 × 12 logical points, matching the interaction radius; each particle searches its cell and the eight adjacent cells. Accepted neighbors and their distances are cached for pressure calculations. Water is retained until cleared, with a capacity of 8,000 particles.
+
+For larger pools, macOS's concurrent dispatch queue runs neighbor searches and pressure calculations across CPU workers. Workers claim chunks of 64 particles, read a fixed position snapshot, and write each particle's own contribution list. Each worker owns reusable scratch buffers aligned to 128 bytes. A completion barrier precedes correction accumulation, which runs in particle and neighbor order on the calling thread. This order preserves bit-identical serial and parallel trajectories. Grid construction, correction application, gravity, and window collisions run on the calling thread.
 
 Native Metal renders in two passes: particle splats add into a density texture, then a surface shader merges and shades that field into water. Water opacity is capped at 78% after merging, with a softer edge transition, so the desktop shows through drops and settled pools. The final output uses premultiplied alpha. Three particle buffers allow GPU work to overlap safely with CPU updates.
 
 The native view directly owns its [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer). [CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink) drives rendering on the AppKit main run loop, including while menus are open. Physics retains its fixed 120 Hz timestep. Signals, menu quit, and the duration limit are also checked by a small timer so shutdown works when no drawable is available. AppKit termination returns through C++ cleanup, which stops the motion helper.
 
-The native window's [ignoresMouseEvents](https://developer.apple.com/documentation/appkit/nswindow/ignoresmouseevents) property keeps it click-through. The window, view, and Metal layer are non-opaque. This replaces the SDL input-shape workaround used by the earlier version.
+The native window's [ignoresMouseEvents](https://developer.apple.com/documentation/appkit/nswindow/ignoresmouseevents) property keeps it click-through. The window, view, and Metal layer are non-opaque.
 
 After rebuilding, quit any running copy through the **💧 menu → Quit Fluid Hose** or **Ctrl+C**, then relaunch. An already running process continues using its original code.
 
@@ -83,7 +94,7 @@ This is a 2D prototype on **one selected display at a time**. Windows are solid,
 "./examples/fluid-hose/build/Fluid Hose.app/Contents/MacOS/fluid-hose" --window-check
 ```
 
-- `--physics-check` requires no graphics access and checks gravity, pooling, collision, hose placement, displacement by moving and overlapping windows, and clearing.
+- `--physics-check` checks gravity, pooling, collision, hose placement, displacement by moving and overlapping windows, and clearing. It also compares serial and parallel trajectories through moving windows, rotated gravity, worker-count changes, snapshot copying, clearing, and display-sized resets. These checks use the CPU and require no graphics access.
 - `--motion-check` checks gravity projection, stale/invalid data, fluid moving toward side walls and the ceiling, and helper transport/shutdown using synthetic data without opening sensors.
 - `--display-check` checks saved selection, disconnect fallback, reconnect with changed native IDs, and conversion between AppKit and Quartz coordinates without requiring graphics access.
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
@@ -94,7 +105,7 @@ This is a 2D prototype on **one selected display at a time**. Windows are solid,
 
 Requires macOS 14 or newer and full Xcode's C++ and Metal tools to rebuild. The root devenv shell supplies helper tools for the shared checks; the hose build does not read `SDL3_ROOT` or `SDL3_LIBRARY`.
 
-On October 9, 2026, `devenv test` rebuilt both examples and passed the physics, display selection, helper, signing, and bundled-dependency checks after the AppKit migration. The hose also built outside devenv with the SDL environment variables removed. Native Metal pixel readback passed for both the CLI executable and packaged app. Both executables' `--window-check` moved the overlay across the built-in Retina display and two LG UltraFine monitors, verified actual window bounds and 2× drawable dimensions, rendered frames, and dispatched Display and Quit menu actions. Duration, SIGINT, and SIGTERM shutdown checks passed, as did a packaged launch through LaunchServices/Finder with a duration limit. The packaged hose links only macOS system libraries. GPU timing remains unmeasured.
+The validated configuration as of October 9, 2026 is an Apple M1 Pro running macOS 15.7.7 and Xcode 16.3 with Apple Clang 17. Shared physics, display, motion helper, signing, and dependency checks passed. Serial and parallel trajectory checks passed under ThreadSanitizer with no reported races. Native Metal readback and packaged window checks passed across the built-in Retina display and two LG UltraFine monitors at 2× backing scale. Duration, worker-limit, signal shutdown, and LaunchServices/Finder launch checks passed. The packaged hose links macOS system libraries.
 
 ## Motion sensor probe
 
@@ -133,39 +144,39 @@ python3 examples/fluid-hose/tools/check-motion-lifetime.py
 
 The lifecycle check force-kills a test owner and verifies the mock reader stops when its control pipe closes. It does not access sensors. Physics, projection, transport, packaged executable, lifecycle, and signing checks passed; live tilt rendering still needs the normal desktop session.
 
-## Performance assessment — October 8, 2026
+## CPU performance
 
-Neighbor caching is integrated into the app and the rebuilt app bundle. It reduced CPU physics step time by approximately 38–43% in these benchmarks, with the same particle trajectories as the original solver. Scratch memory is retained across particles, relaxation iterations, and simulation steps.
+The benchmark compares serial calculations with worker limits of one, two, four, automatic, and the logical CPU count. Every mode starts from identical snapshots and checks that the resulting particle vertices match bit for bit. Measurements use a 1440 × 900 point canvas, 120 settling steps, 12 warmup steps per run, and three runs of 180 timed steps. Mode order alternates across runs. Seeding, snapshot copies, warmup, window enumeration, and Metal rendering are excluded.
 
-The benchmark uses a 1440 × 900 logical canvas, deterministic pouring to seed particles, and 120 settling steps before timing. Each case measures three runs of 180 steps from the same snapshot, with pouring stopped. Setup, snapshot copying, SDL, window enumeration, and Metal rendering are excluded. Apple clang 17 compiles with the app's `-O2` setting on the project's M1 Pro Mac. Times below are milliseconds per step with one window obstacle.
+Results for the Apple M1 Pro with six performance and two efficiency cores, compiled with Apple Clang 17 at `-O2`, are recorded in [the worker benchmark dataset](benchmarks/2026-10-09-physics-parallel.csv). Each case contains 540 timed samples per worker limit. The dataset includes small pools, 2,000–8,000 particles, and one or twelve window obstacles.
 
-| Particles | Original median | Original p95 | Integrated median | Integrated p95 | Median time reduction |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 2,000 | 2.90 | 4.37 | 1.66 | 1.79 | 43% |
-| 4,000 | 7.32 | 11.76 | 4.31 | 4.58 | 41% |
-| 8,000 | 16.40 | 17.95 | 10.09 | 11.36 | 38% |
+Step times in milliseconds with one window obstacle:
 
-A 120 Hz simulation has **8.33 ms per step**, with additional CPU work needed for input and rendering submission. At 8,000 particles, the loop's catch-up steps can still consume substantial time before presenting a frame. Further improvement is needed to meet that budget at full capacity. Increasing obstacles from one to twelve changed the original 8,000-particle median by approximately 3% in this scene.
+| Particles | Serial median | Six-worker median | Six-worker p95 | Median speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 2,000 | 1.645 | 0.809 | 1.343 | 2.03× |
+| 4,000 | 4.196 | 1.760 | 1.933 | 2.38× |
+| 8,000 | 9.844 | 4.085 | 4.631 | 2.41× |
 
-The original solver traversed the same neighbors twice in each density-relaxation iteration, recomputing distances both times. Particle positions are fixed until all corrections have been accumulated, so the app now computes and caches those results once per particle. The integrated solver passed the existing physics checks and produced bit-identical particle vertices throughout a 1,800-step, 2,000-particle comparison, including displacement by moving, overlapping windows. Clearing and pouring again also preserves the original trajectories.
+With twelve window obstacles and 8,000 particles, the six-worker median is 4.850 ms and p95 is 5.239 ms, compared with a serial median of 10.421 ms.
 
-The next changes to consider, in priority order:
+A 120 Hz simulation has an **8.33 ms step budget**. CPU physics timings account for one part of the frame; input, window queries, rendering submission, GPU work, and scheduling add to the complete application cost. These measurements represent standalone wall-clock step times on the host system. CPU affinity and thermal conditions are uncontrolled, and GPU timings remain unmeasured.
 
-1. **Reduce idle rendering.** The current loop renders both passes even with no water or when paused. Retain the last frame when the visible state is unchanged, while continuing to poll the global pointer, Option key, menu controls, and window bounds.
-2. **Measure and reduce GPU work.** Both passes currently use the drawable's full pixel dimensions. On a 2× Retina display, a density field at logical resolution would contain 75% fewer pixels while the final output could remain native resolution. The surface shader can also skip its four gradient samples and lighting on empty pixels, provided it preserves the nozzle. These are unmeasured candidates; density resolution can affect edge detail and lighting. Record [GPU start](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpustarttime) and [end](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpuendtime) timestamps in command-buffer completion handlers before choosing a rendering change.
-3. **For a larger solver improvement, process unordered neighbor pairs once or redesign for parallel updates.** Current corrections write into other particles, so simply threading the loop would introduce data races. A 60 Hz physics preset would reduce tick count, but the pressure terms depend on `dt²` and require behavior and stability checks.
-
-Reproduce the CPU measurements from the workspace root:
+Benchmark commands from the repository root:
 
 ```sh
-./examples/fluid-hose/tools/benchmark-physics.sh
-./examples/fluid-hose/tools/benchmark-neighbor-cache.py
-./examples/fluid-hose/tools/benchmark-neighbor-cache.py --baseline
+./examples/fluid-hose/tools/benchmark-parallel-physics.sh
+./examples/fluid-hose/tools/benchmark-parallel-physics.sh --quick
+./examples/fluid-hose/tools/benchmark-parallel-physics.sh --workers 4
+./examples/fluid-hose/tools/benchmark-parallel-physics.sh --check-only
+./examples/fluid-hose/tools/benchmark-parallel-physics.sh --workers 6 --profile
 ```
 
-Both tools accept `--quick` for a 2,000-particle check. `--profile` adds a 15-second steady workload for sampling in a normal desktop session. The neighbor-cache tool loads the original solver from commit `ed0f543`, generates comparison files under `build/performance`, and verifies equivalence before benchmarking the integrated solver. `--baseline` benchmarks the original instead. This comparison tool requires the repository's Git history; the plain physics benchmark requires no Git or SDL dependencies.
+`--quick` tests up to 2,000 particles with fewer samples. `--workers` compares the selected limit with serial execution. `--check-only` runs physics and trajectory checks. `--profile` adds a 15-second workload and reports process CPU time relative to wall time; 100% represents one CPU core.
 
-Raw results: [original solver](benchmarks/2026-10-08-physics-baseline.csv), [neighbor-cache prototype](benchmarks/2026-10-08-physics-cached-neighbors.csv), and [integrated solver](benchmarks/2026-10-08-physics-integrated.csv). These are standalone wall-clock timings from the development sandbox, with scheduling outliers and no CPU affinity or thermal isolation; they are not live app frame rates. The CSV budget percentage is mean step time divided by 8.33 ms, rather than measured OS CPU utilization. GPU timings and the cost of Quartz window enumeration remain unmeasured. External process sampling was denied by the sandbox.
+A 15-second profile with 2,000 particles, twelve windows, and a six-worker limit recorded 242.1% aggregate process CPU usage. This confirms concurrent CPU execution while the solver's ordered accumulation and other serial phases remain on the calling thread.
+
+The [single-mode benchmark](tools/benchmark-physics.sh) measures the automatic configuration. The [reference comparison](tools/benchmark-neighbor-cache.py) verifies current trajectories against the original solver at commit `ed0f543` and benchmarks either implementation; it requires Git history. Both tools support `--quick` and `--profile`.
 
 ## Code
 
@@ -177,3 +188,4 @@ Raw results: [original solver](benchmarks/2026-10-08-physics-baseline.csv), [nei
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
 - [src/motion.cpp](src/motion.cpp): gravity estimation, display projection, and ownership of the reader process.
 - [src/displays.cpp](src/displays.cpp): selecting a connected display and recovering the saved monitor after reconnect.
+- [tools/benchmark_parallel.cpp](tools/benchmark_parallel.cpp): worker scaling, matching snapshot checks, and CPU profiling.

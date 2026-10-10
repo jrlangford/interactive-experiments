@@ -7,7 +7,7 @@ Native macOS examples for interactive graphics and desktop fluid simulation, bui
 | Example | Behavior | Implementation |
 | --- | --- | --- |
 | [Floating triangle](examples/floating-triangle/README.md) | A rotating colored triangle in a standard window or a transparent, draggable floating window. | SDL3 handles windows and events. Standard mode renders through SDL GPU's Metal backend; floating mode renders through native Metal. |
-| [Fluid hose](examples/fluid-hose/README.md) | A transparent desktop overlay where water lands on window tops, flows around their edges, and pools above the Dock. | AppKit handles the window, menus, displays, and event loop. C++ simulates the fluid; native Metal renders it. |
+| [Fluid hose](examples/fluid-hose/README.md) | A transparent desktop overlay where water lands on window tops, flows around their edges, and pools above the Dock. | AppKit handles the window, menus, displays, and event loop. C++ runs parallel CPU neighbor and pressure calculations; native Metal renders the fluid. |
 
 The hose operates on one selected display at a time. Collision geometry consists of axis-aligned window rectangles. Display selection is remembered by monitor UUID, and optional Mac tilt controls gravity on supported sensor hardware.
 
@@ -51,6 +51,8 @@ Optional direnv activation is configured in [.envrc](.envrc). With direnv instal
 | Fluid hose | `./examples/fluid-hose/run.sh` | Hold Option to pour at the pointer. The 💧 menu controls pouring, pause, clear, display selection, tilt, and quit. |
 
 The hose overlay passes mouse clicks through to desktop windows. Its display menu selects the active monitor; changing monitors clears the water. `--tilt` enables motion-controlled gravity at launch, and `--list-displays` lists available displays. Detailed controls, command-line options, and implementation limits are documented in each example's README.
+
+The hose's automatic CPU worker limit follows the performance-core count, capped at eight; pools below 1,024 particles use serial calculations. `--physics-workers N` selects a worker limit, with zero for automatic selection and one for serial physics. Ordered correction accumulation preserves identical serial and parallel trajectories.
 
 Build output includes the following app bundles, which can be opened in Finder:
 
@@ -97,4 +99,4 @@ GPU readback and native window checks run separately in a desktop session:
 
 Readback checks verify rendered colors, fluid surface alpha, and cleared backgrounds. The hose's window check verifies native window placement, backing scale and drawable dimensions, frame delivery, display switching, menu actions, and click-through and focus settings across connected displays. Manual mouse interaction, physical monitor disconnection, and live tilt are interactive checks.
 
-The validated configuration as of October 9, 2026 is an Apple M1 Pro running macOS 15.7.7, Xcode 16.3 with Apple Clang 17, devenv 2.2.2, and SDL 3.4.10 for the triangle. Shared checks, GPU readback, packaged launches, and hose duration and signal shutdown checks passed. Native hose window checks covered the built-in Retina display and two LG UltraFine monitors, each with a 2× backing scale.
+The validated configuration as of October 9, 2026 is an Apple M1 Pro running macOS 15.7.7, Xcode 16.3 with Apple Clang 17, devenv 2.2.2, and SDL 3.4.10 for the triangle. Shared checks, GPU readback, packaged launches, and hose duration and signal shutdown checks passed. Native hose window checks covered the built-in Retina display and two LG UltraFine monitors, each with a 2× backing scale. Parallel physics trajectory checks also passed under ThreadSanitizer with no reported races. Worker scaling measurements are documented in the [hose performance reference](examples/fluid-hose/README.md#cpu-performance).

@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
         bool window_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
+        unsigned physics_workers = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string argument = argv[i];
             if (argument == "--physics-check") physics_check = true;
@@ -70,7 +71,12 @@ int main(int argc, char** argv) {
             else if (argument == "--display-check") display_check = true;
             else if (argument == "--list-displays") list_displays = true;
             else if (argument == "--window-check") window_check = true;
-            else if (argument == "--display" && i + 1 < argc) {
+            else if (argument == "--physics-workers" && i + 1 < argc) {
+                const char* value = argv[++i];
+                const auto result = std::from_chars(value, value + std::strlen(value), physics_workers);
+                if (result.ec != std::errc{} || *result.ptr != '\0')
+                    throw std::runtime_error("--physics-workers requires an integer: 0 for automatic, 1 for serial, or a worker limit");
+            } else if (argument == "--display" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), display_number);
                 if (result.ec != std::errc{} || *result.ptr != '\0' || display_number == 0)
@@ -81,7 +87,7 @@ int main(int argc, char** argv) {
                 if (result.ec != std::errc{} || *result.ptr != '\0' || duration == 0)
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
-                std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS] "
+                std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS] [--physics-workers N] "
                           "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
@@ -90,11 +96,12 @@ int main(int argc, char** argv) {
                           "The app remembers your selected display and handles display disconnection.\n"
                           "--tilt lets Mac motion change gravity; toggle Use Mac tilt in the droplet menu.\n"
                           "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
+                          "--physics-workers sets the CPU worker limit: 0 is automatic, 1 selects serial physics.\n"
                           "This prototype uses one selected display and ordinary window rectangles.");
                 return 0;
             } else throw std::runtime_error("Unknown or incomplete option: " + argument);
         }
-        if (physics_check) return run_physics_checks() ? 0 : 1;
+        if (physics_check) return run_physics_checks() && run_parallel_physics_checks() ? 0 : 1;
         if (display_check) return run_display_checks() ? 0 : 1;
         const auto motion_helper = (executable_directory() / "probe-motion").string();
         if (motion_check) return run_motion_checks(motion_helper) ? 0 : 1;
@@ -146,7 +153,9 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
 
-        FluidSimulation simulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+        FluidSimulation simulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h), physics_workers);
+        std::printf("Physics: up to %u CPU workers; serial below %zu particles.\n",
+                    simulation.workers(), FluidSimulation::parallel_threshold);
         TiltGravity tilt;
         bool requested_tilt = false;
         DesktopDisplayID pending_display = 0;
@@ -188,7 +197,7 @@ int main(int argc, char** argv) {
                         input.pointer.x += canvas.x - selected.canvas.x;
                         input.pointer.y += canvas.y - selected.canvas.y;
                         canvas = selected.canvas;
-                        simulation = FluidSimulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+                        simulation = FluidSimulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h), physics_workers);
                         accumulator = 0;
                         next_window_poll = now;
                         std::printf("Display: %s — %d × %d points at (%d, %d)\n", selected.name.c_str(),
